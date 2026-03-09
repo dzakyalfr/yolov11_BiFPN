@@ -2077,14 +2077,18 @@ class RealNVP(nn.Module):
 
 
 class _DSConv(nn.Module):
-    """Depthwise-separable conv → BN → ReLU (internal BiFPN building block)."""
+    """Depthwise-separable conv → BN → SiLU (internal BiFPN building block).
+
+    SiLU matches the backbone's default activation (same as Conv throughout YOLOv11),
+    which improves gradient flow between backbone and BiFPN neck.
+    """
 
     def __init__(self, c: int):
         super().__init__()
         self.dw = nn.Conv2d(c, c, 3, padding=1, groups=c, bias=False)
         self.pw = nn.Conv2d(c, c, 1, bias=False)
         self.bn = nn.BatchNorm2d(c, momentum=0.01, eps=1e-3)
-        self.act = nn.ReLU(inplace=True)
+        self.act = nn.SiLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.bn(self.pw(self.dw(x))))

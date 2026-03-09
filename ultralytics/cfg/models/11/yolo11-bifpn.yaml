@@ -1,49 +1,66 @@
 # Ultralytics AGPL-3.0 License
-# YOLOv11 with BiFPN neck (P3/P4/P5 only)
-# Backbone is identical to yolo11.yaml.
-# The entire PAN/FPN head is replaced by a single BiFPN layer.
-# BiFPN outputs [P3, P4, P5] each with `feature_size` channels (128 default).
-# Three Index layers split the list output, then Detect reads all three.
+# YOLOv11 with BiFPN neck (P3/P4/P5 only) — rebuilt for bean classification task
+#
+# Key differences from yolo11.yaml:
+#   - The entire PANet/FPN head is replaced by BiFPN.
+#   - BiFPN projects backbone features to a common `feature_size` width, then
+#     runs `num_layers` bidirectional fusion passes.
+#   - Three Index layers extract P3/P4/P5 from the BiFPN list output.
+#   - Detect head reads the three Index outputs.
+#
+# Tuning notes (per scale):
+#   n  → feature_size=256, num_layers=3  (default below)
+#   s  → increase feature_size to 320, keep num_layers=3
+#   m+ → increase feature_size to 384, num_layers=4
+#
+# Why feature_size=256?
+#   The baseline YOLOv11n neck uses 256-ch at P3, 512-ch at P4, 1024-ch at P5.
+#   128-ch BiFPN crushed those features.  256-ch is a healthy middle ground that
+#   still saves parameters vs PANet while keeping representational power.
+#
+# Why num_layers=3?
+#   EfficientDet paper uses 3-7 BiFPN stacks; 2 is too shallow for good fusion.
 
 # Parameters
-nc: 80      # number of classes
-feature_size: 128   # BiFPN inner channel width; adjust freely
-
+nc: 80          # number of classes (overridden by trainer; set nc=8 for beans)
 scales:
   # [depth, width, max_channels]
   n: [0.50, 0.25, 1024]
   s: [0.50, 0.50, 1024]
-  m: [0.50, 1.00, 512]
-  l: [1.00, 1.00, 512]
-  x: [1.00, 1.50, 512]
+  m: [0.50, 1.00,  512]
+  l: [1.00, 1.00,  512]
+  x: [1.00, 1.50,  512]
 
-# YOLO11n backbone  (unchanged from yolo11.yaml)
+# ---------------------------------------------------------------------------
+# Backbone  (identical to yolo11.yaml — untouched)
+# ---------------------------------------------------------------------------
 backbone:
   # [from, repeats, module, args]
-  - [-1, 1, Conv, [64, 3, 2]]          # 0-P1/2
-  - [-1, 1, Conv, [128, 3, 2]]         # 1-P2/4
-  - [-1, 2, C3k2, [256, False, 0.25]]  # 2
-  - [-1, 1, Conv, [256, 3, 2]]         # 3-P3/8
-  - [-1, 2, C3k2, [512, False, 0.25]]  # 4-P3 output  ← fed to BiFPN
-  - [-1, 1, Conv, [512, 3, 2]]         # 5-P4/16
-  - [-1, 2, C3k2, [512, True]]         # 6-P4 output  ← fed to BiFPN
-  - [-1, 1, Conv, [1024, 3, 2]]        # 7-P5/32
-  - [-1, 2, C3k2, [1024, True]]        # 8
-  - [-1, 1, SPPF, [1024, 5]]           # 9
-  - [-1, 2, C2PSA, [1024]]             # 10-P5 output ← fed to BiFPN
+  - [-1, 1, Conv,  [64,   3, 2]]           # 0   P1/2
+  - [-1, 1, Conv,  [128,  3, 2]]           # 1   P2/4
+  - [-1, 2, C3k2,  [256, False, 0.25]]     # 2
+  - [-1, 1, Conv,  [256,  3, 2]]           # 3   P3/8
+  - [-1, 2, C3k2,  [512, False, 0.25]]     # 4   P3 features  ← BiFPN input
+  - [-1, 1, Conv,  [512,  3, 2]]           # 5   P4/16
+  - [-1, 2, C3k2,  [512,  True]]           # 6   P4 features  ← BiFPN input
+  - [-1, 1, Conv,  [1024, 3, 2]]           # 7   P5/32
+  - [-1, 2, C3k2,  [1024, True]]           # 8
+  - [-1, 1, SPPF,  [1024, 5]]              # 9
+  - [-1, 2, C2PSA, [1024]]                 # 10  P5 features  ← BiFPN input
 
-# Head: BiFPN neck + Detect
+# ---------------------------------------------------------------------------
+# Head: BiFPN neck + Detection head
+# ---------------------------------------------------------------------------
 head:
-  # BiFPN receives [P3, P4, P5] from backbone layers 4, 6, 10.
-  # Args: [feature_size, num_layers]
-  # parse_model will prepend in_channels=[ch[4], ch[6], ch[10]] automatically.
-  - [[4, 6, 10], 1, BiFPN, [128, 2]]   # 11 — outputs list [P3, P4, P5] @ 128-ch each
+  # BiFPN receives [P3, P4, P5] from backbone layers [4, 6, 10].
+  # parse_model automatically prepends in_channels=[ch[4], ch[6], ch[10]].
+  # args = [feature_size, num_layers]  (in_channels is injected by parse_model)
+  - [[4, 6, 10], 1, BiFPN, [256, 3]]    # 11  outputs list [P3, P4, P5] @ 256-ch
 
-  # Index extracts each scale from the list (already supported by ultralytics)
-  # args format for Index in parse_model: [out_channels, list_index]
-  # parse_model uses args[0] as c2 and passes args[1:] to Index constructor
-  - [11, 1, Index, [128, 0]]   # 12 — P3  (128-ch, stride  8)
-  - [11, 1, Index, [128, 1]]   # 13 — P4  (128-ch, stride 16)
-  - [11, 1, Index, [128, 2]]   # 14 — P5  (128-ch, stride 32)
+  # Index[i] extracts the i-th tensor from the BiFPN list output.
+  # parse_model treats first arg as c2 (output channels), rest passed to Index.
+  - [11, 1, Index, [256, 0]]             # 12  P3 @ stride  8  (256-ch)
+  - [11, 1, Index, [256, 1]]             # 13  P4 @ stride 16  (256-ch)
+  - [11, 1, Index, [256, 2]]             # 14  P5 @ stride 32  (256-ch)
 
-  - [[12, 13, 14], 1, Detect, [nc]]   # 15
+  - [[12, 13, 14], 1, Detect, [nc]]      # 15  Detection head
